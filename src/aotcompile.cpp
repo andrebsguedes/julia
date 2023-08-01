@@ -688,7 +688,8 @@ ModuleInfo compute_module_info(Module &M) {
 }
 
 struct Partition {
-    StringSet<> globals;
+    // internalizable
+    StringMap<bool> globals;
     StringMap<unsigned> fvars;
     StringMap<unsigned> gvars;
     size_t weight;
@@ -769,6 +770,8 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
             unsigned parent;
             unsigned size;
             size_t weight;
+            size_t own_weight;
+            bool assigned;
         };
         std::vector<Node> nodes;
         DenseMap<GlobalValue *, unsigned> node_map;
@@ -776,7 +779,7 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
 
         unsigned make(GlobalValue *GV, size_t weight) {
             unsigned idx = nodes.size();
-            nodes.push_back({GV, idx, 1, weight});
+            nodes.push_back({GV, idx, 1, weight, weight, false});
             node_map[GV] = idx;
             return idx;
         }
@@ -806,14 +809,18 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
 
     Partitioner partitioner;
 
+    auto get_weight = [](GlobalValue &G) {
+        if (isa<Function>(G)) {
+            return getFunctionWeight(cast<Function>(G)).weight;
+        } else {
+            return size_t(1);
+        }
+    };
+
     for (auto &G : M.global_values()) {
         if (G.isDeclaration())
             continue;
-        if (isa<Function>(G)) {
-            partitioner.make(&G, getFunctionWeight(cast<Function>(G)).weight);
-        } else {
-            partitioner.make(&G, 1);
-        }
+        partitioner.make(&G, get_weight(G));
     }
 
     // Merge all uses to go together into the same partition
@@ -845,41 +852,73 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
     });
 
     // Assign the root of each partition to a partition, then assign its children to the same one
+    // After assignment, size == partition idx
     for (unsigned idx = 0; idx < idxs.size(); ++idx) {
         auto i = idxs[idx];
         auto root = partitioner.find(i);
-        assert(root == i || partitioner.nodes[root].GV == nullptr);
-        if (partitioner.nodes[root].GV) {
+        assert(root == i || partitioner.nodes[root].assigned);
+        if (!partitioner.nodes[root].assigned) {
             auto &node = partitioner.nodes[root];
             auto &P = *pq.top();
             pq.pop();
             auto name = node.GV->getName();
-            P.globals.insert(name);
+            P.globals.try_emplace(name, false);
             if (fvars.count(node.GV))
                 P.fvars[name] = fvars[node.GV];
             if (gvars.count(node.GV))
                 P.gvars[name] = gvars[node.GV];
             P.weight += node.weight;
-            node.GV = nullptr;
+            node.assigned = 1;
             node.size = &P - partitions.data();
             pq.push(&P);
         }
         if (root != i) {
             auto &node = partitioner.nodes[i];
-            assert(node.GV != nullptr);
+            assert(!node.assigned);
             // we assigned its root already, so just add it to the root's partition
             // don't touch the priority queue, since we're not changing the weight
             auto &P = partitions[partitioner.nodes[root].size];
             auto name = node.GV->getName();
-            P.globals.insert(name);
+            P.globals.try_emplace(name, false);
             if (fvars.count(node.GV))
                 P.fvars[name] = fvars[node.GV];
             if (gvars.count(node.GV))
                 P.gvars[name] = gvars[node.GV];
-            node.GV = nullptr;
+            node.assigned = true;
             node.size = partitioner.nodes[root].size;
         }
     }
+
+    // Mark globals as internal if they are only used
+    // within a partition, saving on exports in Windows DLLs
+    size_t marked_internal = 0;
+    for (unsigned i = 0; i < partitioner.nodes.size(); i++) {
+        // Only internalize hidden visibility GVs, since default visibility may be used externally.
+        if (partitioner.nodes[i].GV->hasDefaultVisibility())
+            continue;
+        bool internal = true;
+        // Can't move if we have to move a whole tree of globals, that's too difficult
+        for (ConstantUses<Instruction> uses(partitioner.nodes[i].GV, M); !uses.done(); uses.next()) {
+            auto val = uses.get_info().val;
+            auto idx = partitioner.node_map.find(val->getFunction());
+            assert(idx != partitioner.node_map.end());
+            // use not in same partition
+            if (partitioner.nodes[idx->second].size != partitioner.nodes[i].size) {
+                internal = false;
+                break;
+            }
+        }
+        if (internal) {
+            partitions[partitioner.nodes[i].size].globals[partitioner.nodes[i].GV->getName()] = true;
+            marked_internal++;
+        }
+    }
+
+    (void) marked_internal;
+    
+    LLVM_DEBUG(dbgs() << "Marked " << marked_internal << " / " << partitioner.nodes.size() << " globals as internal\n");
+    
+    // TODO if COFF, print out warning when exceeding 65536 non-internal variables?
 
     bool verified = verify_partitioning(partitions, M, fvars.size(), gvars.size());
     assert(verified && "Partitioning failed to partition globals correctly");
@@ -1098,31 +1137,40 @@ static auto serializeModule(const Module &M) {
 // deleted, we then materialize the entire module to make use-lists
 // consistent.
 static void materializePreserved(Module &M, Partition &partition) {
-    DenseSet<GlobalValue *> Preserve;
+    DenseMap<GlobalValue *, bool> Preserve;
     for (auto &GV : M.global_values()) {
         if (!GV.isDeclaration()) {
-            if (partition.globals.count(GV.getName())) {
-                Preserve.insert(&GV);
+            auto it = partition.globals.find(GV.getName());
+            if (it != partition.globals.end()) {
+                Preserve.try_emplace(&GV, it->second);
             }
         }
     }
     for (auto &F : M.functions()) {
         if (!F.isDeclaration()) {
-            if (!Preserve.contains(&F)) {
+            F.setDSOLocal(true);
+            auto it = Preserve.find(&F);
+            if (it == Preserve.end()) {
                 F.deleteBody();
                 F.setLinkage(GlobalValue::ExternalLinkage);
                 F.setVisibility(GlobalValue::HiddenVisibility);
-                F.setDSOLocal(true);
+            } else if (it->second) {
+                F.setLinkage(GlobalValue::InternalLinkage);
+                F.setVisibility(GlobalValue::DefaultVisibility);
             }
         }
     }
     for (auto &GV : M.globals()) {
         if (!GV.isDeclaration()) {
-            if (!Preserve.contains(&GV)) {
+            GV.setDSOLocal(true);
+            auto it = Preserve.find(&GV);
+            if (it == Preserve.end()) {
                 GV.setInitializer(nullptr);
                 GV.setLinkage(GlobalValue::ExternalLinkage);
                 GV.setVisibility(GlobalValue::HiddenVisibility);
-                GV.setDSOLocal(true);
+            } else if (it->second) {
+                GV.setLinkage(GlobalValue::InternalLinkage);
+                GV.setVisibility(GlobalValue::DefaultVisibility);
             }
         }
     }
@@ -1135,7 +1183,8 @@ static void materializePreserved(Module &M, Partition &partition) {
     SmallVector<std::pair<GlobalAlias *, GlobalValue *>> DeletedAliases;
     for (auto &GA : M.aliases()) {
         if (!GA.isDeclaration()) {
-            if (!Preserve.contains(&GA)) {
+            auto it = Preserve.find(&GA);
+            if (it == Preserve.end()) {
                 if (GA.getValueType()->isFunctionTy()) {
                     auto F = Function::Create(cast<FunctionType>(GA.getValueType()), GlobalValue::ExternalLinkage, "", &M);
                     // This is an extremely sad hack to make sure the global alias never points to an extern function
@@ -1149,6 +1198,9 @@ static void materializePreserved(Module &M, Partition &partition) {
                     auto GV = new GlobalVariable(M, GA.getValueType(), false, GlobalValue::ExternalLinkage, Constant::getNullValue(GA.getValueType()));
                     DeletedAliases.push_back({ &GA, GV });
                 }
+            } else if (it->second) {
+                GA.setLinkage(GlobalValue::InternalLinkage);
+                GA.setVisibility(GlobalValue::DefaultVisibility);
             }
         }
     }
@@ -1188,7 +1240,7 @@ static void construct_vars(Module &M, Partition &partition) {
     std::vector<std::pair<uint32_t, GlobalValue *>> gvar_pairs;
     gvar_pairs.reserve(partition.gvars.size());
     for (auto &gvar : partition.gvars) {
-        auto GV = M.getGlobalVariable(gvar.first());
+        auto GV = M.getNamedGlobal(gvar.first());
         assert(GV);
         assert(!GV->isDeclaration());
         gvar_pairs.push_back({ gvar.second, GV });
@@ -1281,6 +1333,14 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
     // Single-threaded case
     if (threads == 1) {
         output_timer.startTimer();
+        // With 1 thread, we don't need to have externally visible globals
+        // This is a fallback for COFF, which has limits on external symbol counts
+        for (auto &GV : M.global_values()) {
+            if (GV.hasHiddenVisibility()) {
+                GV.setLinkage(GlobalValue::InternalLinkage);
+                GV.setVisibility(GlobalValue::DefaultVisibility);
+            }
+        }
         {
             JL_TIMING(NATIVE_AOT, NATIVE_Opt);
             outputs[0] = add_output_impl(M, TM, timers[0], unopt_out, opt_out, obj_out, asm_out);
