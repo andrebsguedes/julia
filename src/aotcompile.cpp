@@ -915,9 +915,9 @@ static SmallVector<Partition, 32> partitionModule(Module &M, unsigned threads) {
     }
 
     (void) marked_internal;
-    
+
     LLVM_DEBUG(dbgs() << "Marked " << marked_internal << " / " << partitioner.nodes.size() << " globals as internal\n");
-    
+
     // TODO if COFF, print out warning when exceeding 65536 non-internal variables?
 
     bool verified = verify_partitioning(partitions, M, fvars.size(), gvars.size());
