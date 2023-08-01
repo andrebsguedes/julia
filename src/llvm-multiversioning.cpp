@@ -404,7 +404,7 @@ static inline std::vector<T*> consume_gv(Module &M, const char *name, bool allow
 {
     // Get information about sysimg export functions from the two global variables.
     // Strip them from the Module so that it's easier to handle the uses.
-    GlobalVariable *gv = M.getGlobalVariable(name);
+    GlobalVariable *gv = M.getNamedGlobal(name);
     assert(gv && gv->hasInitializer());
     ArrayType *Ty = cast<ArrayType>(gv->getInitializer()->getType());
     unsigned nele = Ty->getArrayNumElements();
@@ -932,8 +932,8 @@ void CloneCtx::emit_metadata()
     auto fbase = emit_offset_table(M, T_size, fvars, "jl_fvar", suffix);
     auto gbase = emit_offset_table(M, T_size, gvars, "jl_gvar", suffix);
 
-    M.getGlobalVariable("jl_fvar_idxs")->setName("jl_fvar_idxs" + suffix);
-    M.getGlobalVariable("jl_gvar_idxs")->setName("jl_gvar_idxs" + suffix);
+    M.getNamedGlobal("jl_fvar_idxs")->setName("jl_fvar_idxs" + suffix);
+    M.getNamedGlobal("jl_gvar_idxs")->setName("jl_gvar_idxs" + suffix);
 
     uint32_t ntargets = specs.size();
 
@@ -1062,8 +1062,8 @@ static bool runMultiVersioning(Module &M, bool allow_bad_fvars)
         return true;
     }
 
-    GlobalVariable *fvars = M.getGlobalVariable("jl_fvars");
-    GlobalVariable *gvars = M.getGlobalVariable("jl_gvars");
+    GlobalVariable *fvars = M.getNamedGlobal("jl_fvars");
+    GlobalVariable *gvars = M.getNamedGlobal("jl_gvars");
     if (allow_bad_fvars && (!fvars || !fvars->hasInitializer() || !isa<ConstantArray>(fvars->getInitializer()) ||
                             !gvars || !gvars->hasInitializer() || !isa<ConstantArray>(gvars->getInitializer())))
         return false;

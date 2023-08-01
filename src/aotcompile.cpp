@@ -1216,6 +1216,7 @@ static void materializePreserved(Module &M, Partition &partition) {
             cast<GlobalVariable>(Deleted.second)->setInitializer(nullptr);
         }
     }
+    verifyLLVMIR(M);
 }
 
 // Reconstruct jl_fvars, jl_gvars, jl_fvars_idxs, and jl_gvars_idxs from the partition
@@ -1336,7 +1337,7 @@ static SmallVector<AOTOutputs, 16> add_output(Module &M, TargetMachine &TM, Stri
         // With 1 thread, we don't need to have externally visible globals
         // This is a fallback for COFF, which has limits on external symbol counts
         for (auto &GV : M.global_values()) {
-            if (GV.hasHiddenVisibility()) {
+            if (!GV.isDeclaration() && GV.hasHiddenVisibility()) {
                 GV.setLinkage(GlobalValue::InternalLinkage);
                 GV.setVisibility(GlobalValue::DefaultVisibility);
             }
